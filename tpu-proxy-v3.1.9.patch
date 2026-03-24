@@ -1,0 +1,396 @@
+From 5ae75426a93fbc6b1c88172c7b083bf7200194fe Mon Sep 17 00:00:00 2001
+From: Evgeniy Yelagin <evgeniy@kolibr.io>
+Date: Tue, 24 Mar 2026 18:52:50 +0000
+Subject: [PATCH] Add TPU transaction proxy for forwarding non-vote
+ transactions via UDP
+
+Made-with: Cursor
+---
+ core/src/admin_rpc_post_init.rs         |  3 +-
+ core/src/proxy/fetch_stage_manager.rs   |  4 +++
+ core/src/proxy/mod.rs                   |  1 +
+ core/src/proxy/tpu_transaction_proxy.rs | 41 +++++++++++++++++++++++++
+ core/src/tpu.rs                         |  5 +++
+ core/src/validator.rs                   |  4 +++
+ validator/src/admin_rpc_service.rs      | 36 ++++++++++++++++++++++
+ validator/src/cli.rs                    |  3 +-
+ validator/src/commands/mod.rs           |  1 +
+ validator/src/commands/run/args.rs      | 12 ++++++++
+ validator/src/commands/run/execute.rs   | 17 ++++++++++
+ validator/src/commands/tpu_proxy/mod.rs | 30 ++++++++++++++++++
+ validator/src/main.rs                   |  3 ++
+ 13 files changed, 158 insertions(+), 2 deletions(-)
+ create mode 100644 core/src/proxy/tpu_transaction_proxy.rs
+ create mode 100644 validator/src/commands/tpu_proxy/mod.rs
+
+diff --git a/core/src/admin_rpc_post_init.rs b/core/src/admin_rpc_post_init.rs
+index 523a2a893e..724a370589 100644
+--- a/core/src/admin_rpc_post_init.rs
++++ b/core/src/admin_rpc_post_init.rs
+@@ -13,7 +13,7 @@ use {
+     solana_turbine::ShredReceiverAddresses,
+     std::{
+         collections::{HashMap, HashSet},
+-        net::UdpSocket,
++        net::{SocketAddr, UdpSocket},
+         sync::{Arc, Mutex, RwLock},
+     },
+ };
+@@ -90,4 +90,5 @@ pub struct AdminRpcRequestMetadataPostInit {
+     pub relayer_config: Arc<Mutex<RelayerConfig>>,
+     pub shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
+     pub shred_retransmit_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
++    pub tpu_proxy_addresses: Arc<ArcSwap<Vec<SocketAddr>>>,
+ }
+diff --git a/core/src/proxy/fetch_stage_manager.rs b/core/src/proxy/fetch_stage_manager.rs
+index fd7b1c54e5..cb9aea90f4 100644
+--- a/core/src/proxy/fetch_stage_manager.rs
++++ b/core/src/proxy/fetch_stage_manager.rs
+@@ -91,6 +91,7 @@ impl FetchStageManager {
+         exit: Arc<AtomicBool>,
+         bam_enabled: Arc<AtomicU8>,
+         my_fallback_contact_info: contact_info::ContactInfo,
++        tpu_proxy: super::tpu_transaction_proxy::TpuTransactionProxy,
+     ) -> Self {
+         let t_hdl = Self::start(
+             cluster_info,
+@@ -100,6 +101,7 @@ impl FetchStageManager {
+             exit,
+             bam_enabled,
+             my_fallback_contact_info,
++            tpu_proxy,
+         );
+ 
+         Self { t_hdl }
+@@ -125,6 +127,7 @@ impl FetchStageManager {
+         exit: Arc<AtomicBool>,
+         bam_enabled: Arc<AtomicU8>,
+         my_fallback_contact_info: contact_info::ContactInfo,
++        tpu_proxy: super::tpu_transaction_proxy::TpuTransactionProxy,
+     ) -> JoinHandle<()> {
+         Builder::new().name("fetch-stage-manager".into()).spawn(move || {
+             // Save validator's original TPU addresses for fallback
+@@ -153,6 +156,7 @@ impl FetchStageManager {
+                     recv(packet_intercept_rx) -> pkt => {
+                         match pkt {
+                             Ok(pkt) => {
++                                tpu_proxy.proxy_packet_batch(&pkt);
+                                 // Only forward packets when fetch stage is "connected"
+                                 if state.fetch_connected {
+                                     if packet_tx.send(pkt).is_err() {
+diff --git a/core/src/proxy/mod.rs b/core/src/proxy/mod.rs
+index 5ae73d7eff..fa50fc821c 100644
+--- a/core/src/proxy/mod.rs
++++ b/core/src/proxy/mod.rs
+@@ -14,6 +14,7 @@ mod auth;
+ pub mod block_engine_stage;
+ pub mod fetch_stage_manager;
+ pub mod relayer_stage;
++pub mod tpu_transaction_proxy;
+ 
+ use {
+     std::{
+diff --git a/core/src/proxy/tpu_transaction_proxy.rs b/core/src/proxy/tpu_transaction_proxy.rs
+new file mode 100644
+index 0000000000..67a8be6813
+--- /dev/null
++++ b/core/src/proxy/tpu_transaction_proxy.rs
+@@ -0,0 +1,41 @@
++use {
++    arc_swap::ArcSwap,
++    solana_perf::packet::PacketBatch,
++    std::{
++        net::{SocketAddr, UdpSocket},
++        sync::Arc,
++    },
++};
++
++/// Fire-and-forget UDP proxy for incoming TPU transactions.
++/// Sends every packet in a batch to all configured target addresses.
++pub struct TpuTransactionProxy {
++    socket: UdpSocket,
++    targets: Arc<ArcSwap<Vec<SocketAddr>>>,
++}
++
++impl TpuTransactionProxy {
++    pub fn new(targets: Arc<ArcSwap<Vec<SocketAddr>>>) -> Self {
++        let socket = UdpSocket::bind("0.0.0.0:0").expect("bind proxy UDP socket");
++        socket
++            .set_nonblocking(true)
++            .expect("set proxy UDP socket non-blocking");
++        Self { socket, targets }
++    }
++
++    /// Proxy every packet in the batch to all configured targets.
++    /// Silently drops on send errors (non-blocking).
++    pub fn proxy_packet_batch(&self, pkt: &PacketBatch) {
++        let targets = self.targets.load();
++        if targets.is_empty() {
++            return;
++        }
++        for packet in pkt.iter() {
++            if let Some(data) = packet.data(..packet.meta().size) {
++                for target in targets.iter() {
++                    let _ = self.socket.send_to(data, target);
++                }
++            }
++        }
++    }
++}
+diff --git a/core/src/tpu.rs b/core/src/tpu.rs
+index 09ad075d20..96cc698bc3 100644
+--- a/core/src/tpu.rs
++++ b/core/src/tpu.rs
+@@ -202,6 +202,7 @@ impl Tpu {
+         tip_manager_config: TipManagerConfig,
+         shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
+         bam_url: Arc<ArcSwap<Option<String>>>,
++        tpu_proxy_addresses: Arc<ArcSwap<Vec<SocketAddr>>>,
+     ) -> Self {
+         let TpuSockets {
+             transactions: transactions_sockets,
+@@ -393,6 +394,9 @@ impl Tpu {
+             exit.clone(),
+         );
+ 
++        let tpu_proxy = crate::proxy::tpu_transaction_proxy::TpuTransactionProxy::new(
++            tpu_proxy_addresses,
++        );
+         let (heartbeat_tx, heartbeat_rx) = unbounded();
+         let fetch_stage_manager = FetchStageManager::new(
+             cluster_info.clone(),
+@@ -402,6 +406,7 @@ impl Tpu {
+             exit.clone(),
+             bam_enabled.clone(),
+             cluster_info.my_contact_info().clone(),
++            tpu_proxy,
+         );
+ 
+         let relayer_stage = RelayerStage::new(
+diff --git a/core/src/validator.rs b/core/src/validator.rs
+index f3d7370541..ec452e3ea8 100644
+--- a/core/src/validator.rs
++++ b/core/src/validator.rs
+@@ -396,6 +396,7 @@ pub struct ValidatorConfig {
+     pub shred_retransmit_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
+     pub tip_manager_config: TipManagerConfig,
+     pub bam_url: Arc<ArcSwap<Option<String>>>,
++    pub tpu_proxy_addresses: Arc<ArcSwap<Vec<SocketAddr>>>,
+ }
+ 
+ impl ValidatorConfig {
+@@ -488,6 +489,7 @@ impl ValidatorConfig {
+             )),
+             tip_manager_config: TipManagerConfig::default(),
+             bam_url: Arc::new(ArcSwap::from_pointee(None)),
++            tpu_proxy_addresses: Arc::new(ArcSwap::from_pointee(Vec::new())),
+         }
+     }
+ 
+@@ -1788,6 +1790,7 @@ impl Validator {
+             config.tip_manager_config.clone(),
+             config.shred_receiver_addresses.clone(),
+             config.bam_url.clone(),
++            config.tpu_proxy_addresses.clone(),
+         );
+ 
+         datapoint_info!(
+@@ -1827,6 +1830,7 @@ impl Validator {
+             relayer_config: config.relayer_config.clone(),
+             shred_receiver_addresses: config.shred_receiver_addresses.clone(),
+             shred_retransmit_receiver_addresses: config.shred_retransmit_receiver_addresses.clone(),
++            tpu_proxy_addresses: config.tpu_proxy_addresses.clone(),
+         });
+ 
+         Ok(Self {
+diff --git a/validator/src/admin_rpc_service.rs b/validator/src/admin_rpc_service.rs
+index c4e7c39864..658c10e4bd 100644
+--- a/validator/src/admin_rpc_service.rs
++++ b/validator/src/admin_rpc_service.rs
+@@ -316,6 +316,13 @@ pub trait AdminRpc {
+         meta: Self::Metadata,
+         addr: String,
+     ) -> Result<()>;
++
++    #[rpc(meta, name = "setTpuProxyAddresses")]
++    fn set_tpu_proxy_addresses(
++        &self,
++        meta: Self::Metadata,
++        addrs: String,
++    ) -> Result<()>;
+ }
+ 
+ pub struct AdminRpcImpl;
+@@ -704,6 +711,35 @@ impl AdminRpc for AdminRpcImpl {
+         })
+     }
+ 
++    fn set_tpu_proxy_addresses(
++        &self,
++        meta: Self::Metadata,
++        addrs: String,
++    ) -> Result<()> {
++        let addrs = addrs.trim();
++        let parsed: Vec<SocketAddr> = if addrs.is_empty() {
++            Vec::new()
++        } else {
++            addrs
++                .split(',')
++                .map(|s| {
++                    s.trim().parse::<SocketAddr>().map_err(|e| {
++                        jsonrpc_core::error::Error::invalid_params(format!(
++                            "invalid tpu proxy address '{s}': {e}"
++                        ))
++                    })
++                })
++                .collect::<Result<Vec<_>>>()?
++        };
++        info!("Setting TPU proxy addresses: {:?}", parsed);
++        meta.with_post_init(|post_init| {
++            post_init
++                .tpu_proxy_addresses
++                .store(Arc::new(parsed));
++            Ok(())
++        })
++    }
++
+     fn set_staked_nodes_overrides(&self, meta: Self::Metadata, path: String) -> Result<()> {
+         let loaded_config = load_staked_nodes_overrides(&path)
+             .map_err(|err| {
+diff --git a/validator/src/cli.rs b/validator/src/cli.rs
+index 10617c752c..e58bc6f8a1 100644
+--- a/validator/src/cli.rs
++++ b/validator/src/cli.rs
+@@ -88,7 +88,8 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
+         .subcommand(commands::shred::shred_receiver_command(default_args))
+         .subcommand(commands::shred::shred_retransmit_receiver_command(
+             default_args,
+-        ));
++        ))
++        .subcommand(commands::tpu_proxy::command(default_args));
+ 
+     commands::run::add_args(app, default_args)
+         .args(&thread_args(&default_args.thread_args))
+diff --git a/validator/src/commands/mod.rs b/validator/src/commands/mod.rs
+index ef279f1dd6..83f2c03b8b 100644
+--- a/validator/src/commands/mod.rs
++++ b/validator/src/commands/mod.rs
+@@ -15,6 +15,7 @@ pub mod set_log_filter;
+ pub mod set_public_address;
+ pub mod shred;
+ pub mod staked_nodes_overrides;
++pub mod tpu_proxy;
+ pub mod wait_for_restart_window;
+ 
+ use thiserror::Error;
+diff --git a/validator/src/commands/run/args.rs b/validator/src/commands/run/args.rs
+index 46513e5a5c..0afe04b3be 100644
+--- a/validator/src/commands/run/args.rs
++++ b/validator/src/commands/run/args.rs
+@@ -1395,6 +1395,18 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a,
+                  only value to disable.",
+             ),
+     )
++    .arg(
++        Arg::with_name("tpu_proxy_address")
++            .long("tpu-proxy-address")
++            .value_name("TPU_PROXY_ADDRESS")
++            .takes_value(true)
++            .multiple(true)
++            .help(
++                "Forward all incoming non-vote TPU transactions as raw UDP datagrams to these \
++                 addresses. Pass this flag multiple times for multiple targets. \
++                 Each entry should be ip:port.",
++            ),
++    )
+     .arg(
+         Arg::with_name("retransmit_xdp_interface")
+             .hidden(hidden_unless_forced())
+diff --git a/validator/src/commands/run/execute.rs b/validator/src/commands/run/execute.rs
+index b211ee386f..2c0229c2d8 100644
+--- a/validator/src/commands/run/execute.rs
++++ b/validator/src/commands/run/execute.rs
+@@ -603,6 +603,22 @@ pub fn execute(
+         })?,
+     ));
+ 
++    let tpu_proxy_addresses = Arc::new(ArcSwap::from_pointee(
++        matches
++            .values_of("tpu_proxy_address")
++            .map(|vals| {
++                vals.flat_map(|v| v.split(','))
++                    .filter(|s| !s.trim().is_empty())
++                    .map(|s| {
++                        s.trim().parse::<SocketAddr>().unwrap_or_else(|e| {
++                            panic!("invalid tpu-proxy-address '{s}': {e}")
++                        })
++                    })
++                    .collect::<Vec<_>>()
++            })
++            .unwrap_or_default(),
++    ));
++
+     let mut validator_config = ValidatorConfig {
+         require_tower: matches.is_present("require_tower"),
+         tower_storage,
+@@ -725,6 +741,7 @@ pub fn execute(
+         shred_retransmit_receiver_addresses,
+         tip_manager_config,
+         bam_url,
++        tpu_proxy_addresses,
+     };
+ 
+     let reserved = validator_config
+diff --git a/validator/src/commands/tpu_proxy/mod.rs b/validator/src/commands/tpu_proxy/mod.rs
+new file mode 100644
+index 0000000000..7dc046b9f0
+--- /dev/null
++++ b/validator/src/commands/tpu_proxy/mod.rs
+@@ -0,0 +1,30 @@
++use {
++    crate::{admin_rpc_service, cli::DefaultArgs, commands::Result},
++    clap::{value_t_or_exit, App, Arg, ArgMatches, SubCommand},
++    std::path::Path,
++};
++
++pub fn command(_default_args: &DefaultArgs) -> App<'_, '_> {
++    SubCommand::with_name("set-tpu-proxy-addresses")
++        .about("Set TPU proxy addresses for forwarding incoming transactions via UDP")
++        .arg(
++            Arg::with_name("tpu_proxy_address")
++                .long("tpu-proxy-address")
++                .value_name("TPU_PROXY_ADDRESS")
++                .takes_value(true)
++                .help(
++                    "Comma-separated list of ip:port addresses to proxy TPU transactions to via \
++                     UDP. Each incoming non-vote transaction will be sent as a raw UDP datagram to \
++                     all specified addresses. Set to empty string to disable proxying.",
++                )
++                .required(true),
++        )
++}
++
++pub fn execute(subcommand_matches: &ArgMatches, ledger_path: &Path) -> Result<()> {
++    let addrs = value_t_or_exit!(subcommand_matches, "tpu_proxy_address", String);
++    let admin_client = admin_rpc_service::connect(ledger_path);
++    admin_rpc_service::runtime()
++        .block_on(async move { admin_client.await?.set_tpu_proxy_addresses(addrs).await })?;
++    Ok(())
++}
+diff --git a/validator/src/main.rs b/validator/src/main.rs
+index 9b2f6e82b6..8143ad81f9 100644
+--- a/validator/src/main.rs
++++ b/validator/src/main.rs
+@@ -90,6 +90,9 @@ pub fn main() {
+         ("set-shred-retransmit-receiver-address", Some(subcommand_matches)) => {
+             commands::shred::set_shred_retransmit_receiver_execute(subcommand_matches, &ledger_path)
+         }
++        ("set-tpu-proxy-addresses", Some(subcommand_matches)) => {
++            commands::tpu_proxy::execute(subcommand_matches, &ledger_path)
++        }
+         _ => unreachable!(),
+     }
+     .unwrap_or_else(|err| {
+-- 
+2.44.0
+
