@@ -50,9 +50,18 @@ agave-validator --ledger /path/to/ledger set-tpu-proxy-addresses --tpu-proxy-add
 agave-validator --ledger /path/to/ledger set-tpu-proxy-addresses --tpu-proxy-address ""
 ```
 
-## Receiving side
+## UDP datagram format
 
-Each UDP datagram contains raw bytes of a single serialized `VersionedTransaction` (up to 1232 bytes, fits within standard MTU). Transactions are sent as-is with no framing or headers.
+Each UDP datagram has the following layout:
+
+```
+[ transaction bytes (up to 1232 bytes) ][ validator identity pubkey (32 bytes) ]
+```
+
+- **Transaction bytes** -- raw serialized `VersionedTransaction`, same bytes as received on QUIC TPU.
+- **Validator identity** -- 32-byte Ed25519 public key of the validator that forwarded the packet. Allows the receiving side to identify the source validator.
+
+Total datagram size: up to 1264 bytes (fits within standard MTU).
 
 ## Scope
 

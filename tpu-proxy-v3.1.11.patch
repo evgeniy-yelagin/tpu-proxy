@@ -1,4 +1,4 @@
-From 6bdd150bbc77a60a61d4da24924602f858d1472e Mon Sep 17 00:00:00 2001
+From 5b2e03eaf94ea75359a20291060e9e2d47b4c38e Mon Sep 17 00:00:00 2001
 From: Evgeniy Yelagin <evgeniy@kolibr.io>
 Date: Tue, 24 Mar 2026 18:03:16 +0000
 Subject: [PATCH] Add TPU transaction proxy for forwarding non-vote
@@ -15,19 +15,19 @@ minimize changes to existing files.
 Made-with: Cursor
 ---
  core/src/admin_rpc_post_init.rs         |  3 +-
- core/src/proxy/fetch_stage_manager.rs   | 14 +++++++++
+ core/src/proxy/fetch_stage_manager.rs   | 14 ++++++
  core/src/proxy/mod.rs                   |  1 +
- core/src/proxy/tpu_transaction_proxy.rs | 41 +++++++++++++++++++++++++
- core/src/tpu.rs                         |  5 +++
- core/src/validator.rs                   |  4 +++
- validator/src/admin_rpc_service.rs      | 36 ++++++++++++++++++++++
+ core/src/proxy/tpu_transaction_proxy.rs | 57 +++++++++++++++++++++++++
+ core/src/tpu.rs                         |  6 +++
+ core/src/validator.rs                   |  4 ++
+ validator/src/admin_rpc_service.rs      | 36 ++++++++++++++++
  validator/src/cli.rs                    |  3 +-
  validator/src/commands/mod.rs           |  1 +
- validator/src/commands/run/args.rs      | 13 ++++++++
- validator/src/commands/run/execute.rs   | 21 +++++++++++++
- validator/src/commands/tpu_proxy/mod.rs | 30 ++++++++++++++++++
+ validator/src/commands/run/args.rs      | 13 ++++++
+ validator/src/commands/run/execute.rs   | 21 +++++++++
+ validator/src/commands/tpu_proxy/mod.rs | 30 +++++++++++++
  validator/src/main.rs                   |  3 ++
- 13 files changed, 173 insertions(+), 2 deletions(-)
+ 13 files changed, 190 insertions(+), 2 deletions(-)
  create mode 100644 core/src/proxy/tpu_transaction_proxy.rs
  create mode 100644 validator/src/commands/tpu_proxy/mod.rs
 
@@ -152,53 +152,69 @@ index 5ae73d7eff..fa50fc821c 100644
      std::{
 diff --git a/core/src/proxy/tpu_transaction_proxy.rs b/core/src/proxy/tpu_transaction_proxy.rs
 new file mode 100644
-index 0000000000..67a8be6813
+index 0000000000..97bd4bbb68
 --- /dev/null
 +++ b/core/src/proxy/tpu_transaction_proxy.rs
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,57 @@
 +use {
 +    arc_swap::ArcSwap,
 +    solana_perf::packet::PacketBatch,
++    solana_pubkey::Pubkey,
 +    std::{
 +        net::{SocketAddr, UdpSocket},
 +        sync::Arc,
 +    },
 +};
 +
++/// Max serialized transaction (1232) + 32-byte validator identity.
++const MAX_PROXY_DATAGRAM: usize = 1264;
++
 +/// Fire-and-forget UDP proxy for incoming TPU transactions.
-+/// Sends every packet in a batch to all configured target addresses.
++/// Appends the validator's 32-byte identity pubkey to each datagram
++/// so the receiving side can identify the source validator.
 +pub struct TpuTransactionProxy {
 +    socket: UdpSocket,
 +    targets: Arc<ArcSwap<Vec<SocketAddr>>>,
++    identity: [u8; 32],
 +}
 +
 +impl TpuTransactionProxy {
-+    pub fn new(targets: Arc<ArcSwap<Vec<SocketAddr>>>) -> Self {
++    pub fn new(targets: Arc<ArcSwap<Vec<SocketAddr>>>, identity: &Pubkey) -> Self {
 +        let socket = UdpSocket::bind("0.0.0.0:0").expect("bind proxy UDP socket");
 +        socket
 +            .set_nonblocking(true)
 +            .expect("set proxy UDP socket non-blocking");
-+        Self { socket, targets }
++        Self {
++            socket,
++            targets,
++            identity: identity.to_bytes(),
++        }
 +    }
 +
 +    /// Proxy every packet in the batch to all configured targets.
++    /// Each datagram = raw transaction bytes ++ 32-byte validator identity.
 +    /// Silently drops on send errors (non-blocking).
 +    pub fn proxy_packet_batch(&self, pkt: &PacketBatch) {
 +        let targets = self.targets.load();
 +        if targets.is_empty() {
 +            return;
 +        }
++        let mut buf = [0u8; MAX_PROXY_DATAGRAM];
 +        for packet in pkt.iter() {
-+            if let Some(data) = packet.data(..packet.meta().size) {
++            let size = packet.meta().size;
++            if let Some(data) = packet.data(..size) {
++                let total = size + 32;
++                buf[..size].copy_from_slice(data);
++                buf[size..total].copy_from_slice(&self.identity);
 +                for target in targets.iter() {
-+                    let _ = self.socket.send_to(data, target);
++                    let _ = self.socket.send_to(&buf[..total], target);
 +                }
 +            }
 +        }
 +    }
 +}
 diff --git a/core/src/tpu.rs b/core/src/tpu.rs
-index 505f104541..e802878cea 100644
+index 505f104541..27bbf260be 100644
 --- a/core/src/tpu.rs
 +++ b/core/src/tpu.rs
 @@ -202,6 +202,7 @@ impl Tpu {
@@ -209,17 +225,18 @@ index 505f104541..e802878cea 100644
      ) -> Self {
          let TpuSockets {
              transactions: transactions_sockets,
-@@ -394,6 +395,9 @@ impl Tpu {
+@@ -394,6 +395,10 @@ impl Tpu {
          );
  
          let bam_tpu_info = Arc::new(ArcSwap::new(Arc::new(None)));
 +        let tpu_proxy = crate::proxy::tpu_transaction_proxy::TpuTransactionProxy::new(
 +            tpu_proxy_addresses,
++            &cluster_info.id(),
 +        );
          let (heartbeat_tx, heartbeat_rx) = unbounded();
          let fetch_stage_manager = FetchStageManager::new(
              cluster_info.clone(),
-@@ -404,6 +408,7 @@ impl Tpu {
+@@ -404,6 +409,7 @@ impl Tpu {
              bam_enabled.clone(),
              cluster_info.my_contact_info().clone(),
              bam_tpu_info.clone(),
