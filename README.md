@@ -2,16 +2,17 @@
 
 ## Overview
 
-This patch adds the ability to proxy all incoming non-vote TPU transactions to external services via UDP fire-and-forget datagrams. Supports multiple target addresses and hot-reload via admin RPC without validator restart.
+This patch adds the ability to proxy all incoming non-vote TPU transactions to external services via UDP fire-and-forget datagrams. Supports multiple target addresses, hostnames (DNS resolution), and hot-reload via admin RPC without validator restart.
 
 ## Releases
 
 
-| Patch                     | Versions                       |
-| ------------------------- | ------------------------------ |
-| `tpu-proxy-v3.1.8.patch`  | `v3.1.7-jito`, `v3.1.8-jito`   |
-| `tpu-proxy-v3.1.9.patch`  | `v3.1.9-jito`                  |
+| Patch | Versions |
+|-------|----------|
+| `tpu-proxy-v3.1.8.patch` | `v3.1.7-jito`, `v3.1.8-jito` |
+| `tpu-proxy-v3.1.9.patch` | `v3.1.9-jito` |
 | `tpu-proxy-v3.1.11.patch` | `v3.1.10-jito`, `v3.1.11-jito` |
+| `tpu-proxy-v3.1.12.patch` | `v3.1.12-jito` |
 
 
 ## Applying the patch
@@ -19,9 +20,9 @@ This patch adds the ability to proxy all incoming non-vote TPU transactions to e
 ```bash
 # git clone https://github.com/jito-foundation/jito-solana.git
 cd jito-solana
-git checkout tags/v3.1.11-jito   # or your target version
+git checkout tags/v3.1.12-jito   # or your target version
 
-git am < tpu-proxy-v3.1.11.patch # use the matching patch
+git am < tpu-proxy-v3.1.12.patch # use the matching patch
 ```
 
 ## Usage
@@ -32,16 +33,23 @@ git am < tpu-proxy-v3.1.11.patch # use the matching patch
 agave-validator ... --tpu-proxy-address 1.2.3.4:9000 --tpu-proxy-address 5.6.7.8:9001
 ```
 
-Comma-separated format is also supported:
+Both IP addresses and hostnames are supported (DNS is resolved at startup):
 
 ```bash
-agave-validator ... --tpu-proxy-address 1.2.3.4:9000,5.6.7.8:9001
+agave-validator ... --tpu-proxy-address stream.example.com:9000
+```
+
+Comma-separated format also works:
+
+```bash
+agave-validator ... --tpu-proxy-address 1.2.3.4:9000,stream.example.com:9001
 ```
 
 **Hot-reload addresses at runtime (no restart required):**
 
 ```bash
-agave-validator --ledger /path/to/ledger set-tpu-proxy-addresses --tpu-proxy-address "1.2.3.4:9000,5.6.7.8:9001"
+agave-validator --ledger /path/to/ledger set-tpu-proxy-addresses \
+  --tpu-proxy-address "1.2.3.4:9000,stream.example.com:9001"
 ```
 
 **Disable proxying at runtime:**
