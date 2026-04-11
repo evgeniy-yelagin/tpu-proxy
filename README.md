@@ -12,7 +12,7 @@ This patch adds the ability to proxy all incoming non-vote TPU transactions to e
 | `tpu-proxy-v3.1.8.patch` | `v3.1.7-jito`, `v3.1.8-jito` |
 | `tpu-proxy-v3.1.9.patch` | `v3.1.9-jito` |
 | `tpu-proxy-v3.1.11.patch` | `v3.1.10-jito`, `v3.1.11-jito` |
-| `tpu-proxy-v3.1.12.patch` | `v3.1.12-jito` |
+| `tpu-proxy-v3.1.12.patch` | `v3.1.12-jito`, `v3.1.13-jito` |
 
 
 ## Applying the patch
