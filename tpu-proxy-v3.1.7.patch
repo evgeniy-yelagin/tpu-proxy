@@ -1,26 +1,30 @@
-From bec5efef0de4b3d2513afafd46d48f382b21dc68 Mon Sep 17 00:00:00 2001
+From c5890d0b273818cab91fddfc5a442c6ae22f3978 Mon Sep 17 00:00:00 2001
 From: Evgeniy Yelagin <evgeniy@kolibr.io>
-Date: Tue, 24 Mar 2026 18:58:19 +0000
-Subject: [PATCH] Add TPU transaction proxy for forwarding non-vote
- transactions via UDP
+Date: Wed, 15 Apr 2026 18:23:03 +0100
+Subject: [PATCH] tpu-proxy: post-sigverify transaction forwarding
+ (v3.1.7-v3.1.8)
+
+Forward verified TPU transactions to external UDP endpoints after
+signature verification. Appends 32-byte validator identity to each
+datagram. Supports CLI --tpu-proxy-address and runtime RPC
+setTpuProxyAddresses.
 
 Made-with: Cursor
 ---
  core/src/admin_rpc_post_init.rs         |  1 +
- core/src/fetch_stage.rs                 | 15 +++++-
- core/src/proxy/fetch_stage_manager.rs   |  4 ++
  core/src/proxy/mod.rs                   |  1 +
- core/src/proxy/tpu_transaction_proxy.rs | 69 +++++++++++++++++++++++++
- core/src/tpu.rs                         | 10 ++++
+ core/src/proxy/tpu_transaction_proxy.rs | 72 +++++++++++++++++++++++++
+ core/src/sigverify.rs                   | 12 +++++
+ core/src/tpu.rs                         |  7 ++-
  core/src/validator.rs                   |  4 ++
- validator/src/admin_rpc_service.rs      | 46 +++++++++++++++++
+ validator/src/admin_rpc_service.rs      | 46 ++++++++++++++++
  validator/src/cli.rs                    |  3 +-
  validator/src/commands/mod.rs           |  1 +
- validator/src/commands/run/args.rs      | 12 +++++
- validator/src/commands/run/execute.rs   | 24 +++++++++
+ validator/src/commands/run/args.rs      | 13 +++++
+ validator/src/commands/run/execute.rs   | 30 +++++++++++
  validator/src/commands/tpu_proxy/mod.rs | 30 +++++++++++
  validator/src/main.rs                   |  3 ++
- 14 files changed, 220 insertions(+), 3 deletions(-)
+ 13 files changed, 221 insertions(+), 2 deletions(-)
  create mode 100644 core/src/proxy/tpu_transaction_proxy.rs
  create mode 100644 validator/src/commands/tpu_proxy/mod.rs
 
@@ -34,117 +38,6 @@ index f3dd924f8f..9c93ec2c38 100644
      pub shred_retransmit_receiver_address: Arc<ArcSwap<Option<SocketAddr>>>,
 +    pub tpu_proxy_addresses: Arc<ArcSwap<Vec<SocketAddr>>>,
  }
-diff --git a/core/src/fetch_stage.rs b/core/src/fetch_stage.rs
-index 6a2f1faf31..333abebace 100644
---- a/core/src/fetch_stage.rs
-+++ b/core/src/fetch_stage.rs
-@@ -1,7 +1,7 @@
- //! The `fetch_stage` batches input from a UDP socket and sends it to a channel.
- 
- use {
--    crate::result::{Error, Result},
-+    crate::{proxy::tpu_transaction_proxy::TpuTransactionProxy, result::{Error, Result}},
-     crossbeam_channel::{unbounded, RecvTimeoutError},
-     solana_clock::{DEFAULT_TICKS_PER_SLOT, HOLD_TRANSACTIONS_SLOT_OFFSET},
-     solana_metrics::{inc_new_counter_debug, inc_new_counter_info},
-@@ -56,6 +56,7 @@ impl FetchStage {
-                 coalesce,
-                 None,
-                 DEFAULT_TPU_ENABLE_UDP,
-+                None,
-             ),
-             receiver,
-             vote_receiver,
-@@ -76,6 +77,7 @@ impl FetchStage {
-         coalesce: Option<Duration>,
-         in_vote_only_mode: Option<Arc<AtomicBool>>,
-         tpu_enable_udp: bool,
-+        tpu_fwd_proxy: Option<TpuTransactionProxy>,
-     ) -> Self {
-         let tx_sockets = sockets.into_iter().map(Arc::new).collect();
-         let tpu_forwards_sockets = tpu_forwards_sockets.into_iter().map(Arc::new).collect();
-@@ -93,6 +95,7 @@ impl FetchStage {
-             coalesce,
-             in_vote_only_mode,
-             tpu_enable_udp,
-+            tpu_fwd_proxy,
-         )
-     }
- 
-@@ -100,6 +103,7 @@ impl FetchStage {
-         recvr: &PacketBatchReceiver,
-         sendr: &PacketBatchSender,
-         poh_recorder: &Arc<RwLock<PohRecorder>>,
-+        tpu_proxy: &Option<TpuTransactionProxy>,
-     ) -> Result<()> {
-         let mark_forwarded = |mut packet: PacketRefMut| {
-             packet.meta_mut().flags |= PacketFlags::FORWARDED;
-@@ -119,6 +123,12 @@ impl FetchStage {
-             }
-         }
- 
-+        if let Some(proxy) = tpu_proxy {
-+            for batch in &packet_batches {
-+                proxy.proxy_packet_batch(batch);
-+            }
-+        }
-+
-         if poh_recorder
-             .read()
-             .unwrap()
-@@ -152,6 +162,7 @@ impl FetchStage {
-         coalesce: Option<Duration>,
-         in_vote_only_mode: Option<Arc<AtomicBool>>,
-         tpu_enable_udp: bool,
-+        tpu_fwd_proxy: Option<TpuTransactionProxy>,
-     ) -> Self {
-         let recycler: PacketBatchRecycler = Recycler::warmed(1000, 1024);
- 
-@@ -231,7 +242,7 @@ impl FetchStage {
-             .name("solFetchStgFwRx".to_string())
-             .spawn(move || loop {
-                 if let Err(e) =
--                    Self::handle_forwarded_packets(&forward_receiver, &sender, &poh_recorder)
-+                    Self::handle_forwarded_packets(&forward_receiver, &sender, &poh_recorder, &tpu_fwd_proxy)
-                 {
-                     match e {
-                         Error::RecvTimeout(RecvTimeoutError::Disconnected) => break,
-diff --git a/core/src/proxy/fetch_stage_manager.rs b/core/src/proxy/fetch_stage_manager.rs
-index fd7b1c54e5..cb9aea90f4 100644
---- a/core/src/proxy/fetch_stage_manager.rs
-+++ b/core/src/proxy/fetch_stage_manager.rs
-@@ -91,6 +91,7 @@ impl FetchStageManager {
-         exit: Arc<AtomicBool>,
-         bam_enabled: Arc<AtomicU8>,
-         my_fallback_contact_info: contact_info::ContactInfo,
-+        tpu_proxy: super::tpu_transaction_proxy::TpuTransactionProxy,
-     ) -> Self {
-         let t_hdl = Self::start(
-             cluster_info,
-@@ -100,6 +101,7 @@ impl FetchStageManager {
-             exit,
-             bam_enabled,
-             my_fallback_contact_info,
-+            tpu_proxy,
-         );
- 
-         Self { t_hdl }
-@@ -125,6 +127,7 @@ impl FetchStageManager {
-         exit: Arc<AtomicBool>,
-         bam_enabled: Arc<AtomicU8>,
-         my_fallback_contact_info: contact_info::ContactInfo,
-+        tpu_proxy: super::tpu_transaction_proxy::TpuTransactionProxy,
-     ) -> JoinHandle<()> {
-         Builder::new().name("fetch-stage-manager".into()).spawn(move || {
-             // Save validator's original TPU addresses for fallback
-@@ -153,6 +156,7 @@ impl FetchStageManager {
-                     recv(packet_intercept_rx) -> pkt => {
-                         match pkt {
-                             Ok(pkt) => {
-+                                tpu_proxy.proxy_packet_batch(&pkt);
-                                 // Only forward packets when fetch stage is "connected"
-                                 if state.fetch_connected {
-                                     if packet_tx.send(pkt).is_err() {
 diff --git a/core/src/proxy/mod.rs b/core/src/proxy/mod.rs
 index 4fb181912c..666673fae2 100644
 --- a/core/src/proxy/mod.rs
@@ -159,10 +52,10 @@ index 4fb181912c..666673fae2 100644
      std::{
 diff --git a/core/src/proxy/tpu_transaction_proxy.rs b/core/src/proxy/tpu_transaction_proxy.rs
 new file mode 100644
-index 0000000000..be2a8acb87
+index 0000000000..c55fc324a6
 --- /dev/null
 +++ b/core/src/proxy/tpu_transaction_proxy.rs
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,72 @@
 +use {
 +    arc_swap::ArcSwap,
 +    solana_gossip::cluster_info::ClusterInfo,
@@ -203,37 +96,86 @@ index 0000000000..be2a8acb87
 +        }
 +    }
 +
-+    /// Proxy every packet in the batch to all configured targets.
++    /// Proxy every non-discarded packet across all batches to configured targets.
++    /// Loads identity and target list once per call to avoid repeated atomic ops.
 +    /// Each datagram = raw transaction bytes ++ 32-byte validator identity.
 +    /// Silently drops on send errors (non-blocking).
-+    pub fn proxy_packet_batch(&self, pkt: &PacketBatch) {
++    pub fn proxy_packet_batches(&self, batches: &[PacketBatch]) {
 +        let targets = self.targets.load();
 +        if targets.is_empty() {
 +            return;
 +        }
 +        let identity = self.cluster_info.id().to_bytes();
 +        let mut buf = [0u8; MAX_PROXY_DATAGRAM];
-+        for packet in pkt.iter() {
-+            if packet.meta().discard() {
-+                continue;
-+            }
-+            let size = packet.meta().size;
-+            if size < MIN_TRANSACTION_SIZE || size + 32 > MAX_PROXY_DATAGRAM {
-+                continue;
-+            }
-+            if let Some(data) = packet.data(..size) {
-+                let total = size + 32;
-+                buf[..size].copy_from_slice(data);
-+                buf[size..total].copy_from_slice(&identity);
-+                for target in targets.iter() {
-+                    let _ = self.socket.send_to(&buf[..total], target);
++        for pkt in batches {
++            for packet in pkt.iter() {
++                if packet.meta().discard() {
++                    continue;
++                }
++                let size = packet.meta().size;
++                if size < MIN_TRANSACTION_SIZE || size + 32 > MAX_PROXY_DATAGRAM {
++                    continue;
++                }
++                if let Some(data) = packet.data(..size) {
++                    let total = size + 32;
++                    buf[..size].copy_from_slice(data);
++                    buf[size..total].copy_from_slice(&identity);
++                    for target in targets.iter() {
++                        let _ = self.socket.send_to(&buf[..total], target);
++                    }
 +                }
 +            }
 +        }
 +    }
 +}
+diff --git a/core/src/sigverify.rs b/core/src/sigverify.rs
+index de54c72597..23adf73299 100644
+--- a/core/src/sigverify.rs
++++ b/core/src/sigverify.rs
+@@ -10,6 +10,7 @@ pub use solana_perf::sigverify::{
+ use {
+     crate::{
+         banking_trace::BankingPacketSender,
++        proxy::tpu_transaction_proxy::TpuTransactionProxy,
+         sigverify_stage::{SigVerifier, SigVerifyServiceError},
+     },
+     agave_banking_stage_ingress_types::BankingPacketBatch,
+@@ -23,6 +24,7 @@ pub struct TransactionSigVerifier {
+     recycler: Recycler<TxOffset>,
+     recycler_out: Recycler<PinnedVec<u8>>,
+     reject_non_vote: bool,
++    tpu_proxy: Option<TpuTransactionProxy>,
+ }
+ 
+ impl TransactionSigVerifier {
+@@ -46,8 +48,14 @@ impl TransactionSigVerifier {
+             recycler: Recycler::warmed(50, 4096),
+             recycler_out: Recycler::warmed(50, 4096),
+             reject_non_vote: false,
++            tpu_proxy: None,
+         }
+     }
++
++    pub fn with_tpu_proxy(mut self, proxy: TpuTransactionProxy) -> Self {
++        self.tpu_proxy = Some(proxy);
++        self
++    }
+ }
+ 
+ impl SigVerifier for TransactionSigVerifier {
+@@ -57,6 +65,10 @@ impl SigVerifier for TransactionSigVerifier {
+         &mut self,
+         packet_batches: Vec<PacketBatch>,
+     ) -> Result<(), SigVerifyServiceError<Self::SendType>> {
++        if let Some(ref proxy) = self.tpu_proxy {
++            proxy.proxy_packet_batches(&packet_batches);
++        }
++
+         let banking_packet_batch = BankingPacketBatch::new(packet_batches);
+         if let Some(forward_stage_sender) = &self.forward_stage_sender {
+             self.banking_stage_sender
 diff --git a/core/src/tpu.rs b/core/src/tpu.rs
-index 416638f13f..f53e802d07 100644
+index 416638f13f..62a2b2dc24 100644
 --- a/core/src/tpu.rs
 +++ b/core/src/tpu.rs
 @@ -197,6 +197,7 @@ impl Tpu {
@@ -244,56 +186,39 @@ index 416638f13f..f53e802d07 100644
      ) -> Self {
          let TpuSockets {
              transactions: transactions_sockets,
-@@ -240,6 +241,10 @@ impl Tpu {
-             None, // coalesce
-             Some(bank_forks.read().unwrap().get_vote_only_mode_signal()),
-             tpu_enable_udp,
-+            Some(crate::proxy::tpu_transaction_proxy::TpuTransactionProxy::new(
-+                tpu_proxy_addresses.clone(),
+@@ -339,7 +340,11 @@ impl Tpu {
+             let verifier = TransactionSigVerifier::new(
+                 banking_stage_sender.clone(),
+                 enable_block_production_forwarding.then(|| forward_stage_sender.clone()),
+-            );
++            )
++            .with_tpu_proxy(crate::proxy::tpu_transaction_proxy::TpuTransactionProxy::new(
++                tpu_proxy_addresses,
 +                cluster_info.clone(),
-+            )),
-         );
- 
-         let staked_nodes_updater_service = StakedNodesUpdaterService::new(
-@@ -388,6 +393,10 @@ impl Tpu {
-             exit.clone(),
-         );
- 
-+        let tpu_proxy = crate::proxy::tpu_transaction_proxy::TpuTransactionProxy::new(
-+            tpu_proxy_addresses,
-+            cluster_info.clone(),
-+        );
-         let (heartbeat_tx, heartbeat_rx) = unbounded();
-         let fetch_stage_manager = FetchStageManager::new(
-             cluster_info.clone(),
-@@ -397,6 +406,7 @@ impl Tpu {
-             exit.clone(),
-             bam_enabled.clone(),
-             cluster_info.my_contact_info().clone(),
-+            tpu_proxy,
-         );
- 
-         let relayer_stage = RelayerStage::new(
++            ));
+             SigVerifier::Local(SigVerifyStage::new(
+                 sigverify_stage_receiver,
+                 verifier,
 diff --git a/core/src/validator.rs b/core/src/validator.rs
-index fea3e83f34..634dd68749 100644
+index fea3e83f34..c7f8e639d4 100644
 --- a/core/src/validator.rs
 +++ b/core/src/validator.rs
-@@ -395,6 +395,7 @@ pub struct ValidatorConfig {
+@@ -393,6 +393,7 @@ pub struct ValidatorConfig {
+     pub block_engine_config: Arc<Mutex<BlockEngineConfig>>,
+     pub shred_receiver_address: Arc<ArcSwap<Option<SocketAddr>>>,
      pub shred_retransmit_receiver_address: Arc<ArcSwap<Option<SocketAddr>>>,
++    pub tpu_proxy_addresses: Arc<ArcSwap<Vec<SocketAddr>>>,
      pub tip_manager_config: TipManagerConfig,
      pub bam_url: Arc<Mutex<Option<String>>>,
-+    pub tpu_proxy_addresses: Arc<ArcSwap<Vec<SocketAddr>>>,
  }
- 
- impl ValidatorConfig {
-@@ -483,6 +484,7 @@ impl ValidatorConfig {
+@@ -481,6 +482,7 @@ impl ValidatorConfig {
+             block_engine_config: Arc::new(Mutex::new(BlockEngineConfig::default())),
+             shred_receiver_address: Arc::new(ArcSwap::from_pointee(None)),
              shred_retransmit_receiver_address: Arc::new(ArcSwap::from_pointee(None)),
++            tpu_proxy_addresses: Arc::new(ArcSwap::from_pointee(Vec::new())),
              tip_manager_config: TipManagerConfig::default(),
              bam_url: Arc::new(Mutex::new(None)),
-+            tpu_proxy_addresses: Arc::new(ArcSwap::from_pointee(Vec::new())),
          }
-     }
- 
 @@ -1783,6 +1785,7 @@ impl Validator {
              config.tip_manager_config.clone(),
              config.shred_receiver_address.clone(),
@@ -408,10 +333,10 @@ index ef279f1dd6..83f2c03b8b 100644
  
  use thiserror::Error;
 diff --git a/validator/src/commands/run/args.rs b/validator/src/commands/run/args.rs
-index 3d77cf1a47..2544065d1c 100644
+index 3d77cf1a47..800331f857 100644
 --- a/validator/src/commands/run/args.rs
 +++ b/validator/src/commands/run/args.rs
-@@ -1387,6 +1387,18 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a,
+@@ -1387,6 +1387,19 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a,
                   normal turbine operation. Set to empty string to disable.",
              ),
      )
@@ -422,49 +347,56 @@ index 3d77cf1a47..2544065d1c 100644
 +            .takes_value(true)
 +            .multiple(true)
 +            .help(
-+                "Forward all incoming non-vote TPU transactions as raw UDP datagrams to these \
-+                 addresses. Pass this flag multiple times for multiple targets. \
-+                 Each entry should be ip:port.",
++                "Forward all incoming non-vote TPU transactions to these addresses via UDP. \
++                 Each datagram = raw transaction bytes + 32-byte validator identity. \
++                 Pass this flag multiple times for multiple destinations. \
++                 Supports both IP:port and hostname:port.",
 +            ),
 +    )
      .arg(
          Arg::with_name("retransmit_xdp_interface")
              .hidden(hidden_unless_forced())
 diff --git a/validator/src/commands/run/execute.rs b/validator/src/commands/run/execute.rs
-index 9ba288882c..4e35a12252 100644
+index 9ba288882c..5f986bf958 100644
 --- a/validator/src/commands/run/execute.rs
 +++ b/validator/src/commands/run/execute.rs
-@@ -583,6 +583,29 @@ pub fn execute(
-             }),
-     ));
+@@ -545,6 +545,35 @@ pub fn execute(
+ 
+     let bam_url = Arc::new(Mutex::new(crate::commands::bam::extract_bam_url(matches)?));
  
 +    let tpu_proxy_addresses = {
-+        use std::net::ToSocketAddrs;
++        use std::{io, net::ToSocketAddrs};
 +        let addrs: Vec<SocketAddr> = matches
 +            .values_of("tpu_proxy_address")
-+            .map(|vals| {
-+                vals.flat_map(|s| s.split(','))
-+                    .filter(|s| !s.trim().is_empty())
-+                    .map(|s| {
-+                        let s = s.trim();
-+                        s.to_socket_addrs()
-+                            .unwrap_or_else(|e| panic!("Invalid --tpu-proxy-address '{s}': {e}"))
-+                            .next()
-+                            .unwrap_or_else(|| panic!("--tpu-proxy-address '{s}' did not resolve"))
++            .into_iter()
++            .flatten()
++            .flat_map(|s| s.split(','))
++            .map(|s| s.trim())
++            .filter(|s| !s.is_empty())
++            .map(|s| {
++                s.to_socket_addrs()
++                    .map_err(|e| {
++                        io::Error::new(
++                            io::ErrorKind::InvalidInput,
++                            format!("invalid tpu-proxy-address '{s}': {e}"),
++                        )
++                    })?
++                    .next()
++                    .ok_or_else(|| {
++                        io::Error::new(
++                            io::ErrorKind::InvalidInput,
++                            format!("tpu-proxy-address '{s}' did not resolve"),
++                        )
 +                    })
-+                    .collect()
 +            })
-+            .unwrap_or_default();
-+        if !addrs.is_empty() {
-+            info!("TPU proxy addresses: {:?}", addrs);
-+        }
++            .collect::<io::Result<_>>()?;
 +        Arc::new(ArcSwap::from_pointee(addrs))
 +    };
 +
-     let mut validator_config = ValidatorConfig {
-         require_tower: matches.is_present("require_tower"),
-         tower_storage,
-@@ -705,6 +728,7 @@ pub fn execute(
+     // Defaults are set in cli definition, safe to use unwrap() here
+     let expected_heartbeat_interval_ms: u64 =
+         value_of(matches, "relayer_expected_heartbeat_interval_ms").unwrap();
+@@ -705,6 +734,7 @@ pub fn execute(
          shred_retransmit_receiver_address,
          tip_manager_config,
          bam_url,
@@ -474,13 +406,13 @@ index 9ba288882c..4e35a12252 100644
      let reserved = validator_config
 diff --git a/validator/src/commands/tpu_proxy/mod.rs b/validator/src/commands/tpu_proxy/mod.rs
 new file mode 100644
-index 0000000000..7dc046b9f0
+index 0000000000..6906a70ca0
 --- /dev/null
 +++ b/validator/src/commands/tpu_proxy/mod.rs
 @@ -0,0 +1,30 @@
 +use {
 +    crate::{admin_rpc_service, cli::DefaultArgs, commands::Result},
-+    clap::{value_t_or_exit, App, Arg, ArgMatches, SubCommand},
++    clap::{App, Arg, ArgMatches, SubCommand, value_t_or_exit},
 +    std::path::Path,
 +};
 +
