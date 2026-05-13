@@ -12,6 +12,7 @@ This patch adds the ability to proxy all incoming TPU transactions to external s
 | `tpu-proxy-v3.1.7.patch` | `v3.1.7-jito`, `v3.1.8-jito` |
 | `tpu-proxy-v3.1.9.patch` | `v3.1.9-jito`, `v3.1.10-jito`, `v3.1.11-jito` |
 | `tpu-proxy-v3.1.12.patch` | `v3.1.12-jito`, `v3.1.13-jito` |
+| `tpu-proxy-v3.1.14.patch` | `v3.1.14-jito` |
 
 
 ## Applying the patch
