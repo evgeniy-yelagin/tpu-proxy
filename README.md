@@ -13,6 +13,7 @@ This patch adds the ability to proxy all incoming TPU transactions to external s
 | `tpu-proxy-v3.1.9.patch` | `v3.1.9-jito`, `v3.1.10-jito`, `v3.1.11-jito` |
 | `tpu-proxy-v3.1.12.patch` | `v3.1.12-jito`, `v3.1.13-jito` |
 | `tpu-proxy-v3.1.14.patch` | `v3.1.14-jito` |
+| `tpu-proxy-v4.0.0.patch` | `v4.0.0-jito` |
 
 
 ## Applying the patch
@@ -20,9 +21,8 @@ This patch adds the ability to proxy all incoming TPU transactions to external s
 ```bash
 # git clone https://github.com/jito-foundation/jito-solana.git
 cd jito-solana
-git checkout tags/v3.1.13-jito   # or your target version
-
-git apply tpu-proxy-v3.1.12.patch
+git checkout tags/v4.0.0-jito         # or your target version
+git apply tpu-proxy-v4.0.0.patch      # use the matching patch
 ```
 
 ## Usage

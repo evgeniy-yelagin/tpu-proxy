@@ -1,0 +1,560 @@
+From 0f77d0221b8969323f6d1bb96b5da5fb59e11a93 Mon Sep 17 00:00:00 2001
+From: Evgeniy Yelagin <evgeniy@kolibr.io>
+Date: Tue, 19 May 2026 18:34:59 +0100
+Subject: [PATCH] Add TPU transaction proxy for forwarding non-vote
+ transactions via UDP
+
+Two independent proxy instances capture all non-vote transaction traffic:
+- Port 8009 (TPU QUIC) via FetchStageManager
+- Port 8010 (TPU Forward QUIC) via FetchStage
+
+Each proxied UDP datagram contains raw transaction bytes + 32-byte
+validator identity pubkey. Supports multiple targets, hostnames,
+and hot-reload via admin RPC (set-tpu-proxy-addresses).
+
+---
+ core/src/admin_rpc_post_init.rs         |  3 +-
+ core/src/fetch_stage.rs                 | 15 +++++-
+ core/src/proxy/fetch_stage_manager.rs   | 12 ++++-
+ core/src/proxy/mod.rs                   |  1 +
+ core/src/proxy/tpu_transaction_proxy.rs | 69 +++++++++++++++++++++++++
+ core/src/tpu.rs                         | 10 ++++
+ core/src/validator.rs                   |  4 ++
+ validator/src/admin_rpc_service.rs      | 45 ++++++++++++++++
+ validator/src/cli.rs                    |  3 +-
+ validator/src/commands/mod.rs           |  1 +
+ validator/src/commands/run/args.rs      | 13 +++++
+ validator/src/commands/run/execute.rs   | 33 ++++++++++++
+ validator/src/commands/tpu_proxy/mod.rs | 30 +++++++++++
+ validator/src/main.rs                   |  3 ++
+ 14 files changed, 236 insertions(+), 6 deletions(-)
+ create mode 100644 core/src/proxy/tpu_transaction_proxy.rs
+ create mode 100644 validator/src/commands/tpu_proxy/mod.rs
+
+diff --git a/core/src/admin_rpc_post_init.rs b/core/src/admin_rpc_post_init.rs
+index c1975893f2..c8700c41a6 100644
+--- a/core/src/admin_rpc_post_init.rs
++++ b/core/src/admin_rpc_post_init.rs
+@@ -14,7 +14,7 @@ use {
+     solana_turbine::ShredReceiverAddresses,
+     std::{
+         collections::{HashMap, HashSet},
+-        net::UdpSocket,
++        net::{SocketAddr, UdpSocket},
+         sync::{Arc, RwLock},
+     },
+     tokio::sync::mpsc,
+@@ -98,4 +98,5 @@ pub struct AdminRpcRequestMetadataPostInit {
+     pub relayer_config: Arc<ArcSwap<RelayerConfig>>,
+     pub shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
+     pub shred_retransmit_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
++    pub tpu_proxy_addresses: Arc<ArcSwap<Vec<SocketAddr>>>,
+ }
+diff --git a/core/src/fetch_stage.rs b/core/src/fetch_stage.rs
+index 2663792d58..785ef4f336 100644
+--- a/core/src/fetch_stage.rs
++++ b/core/src/fetch_stage.rs
+@@ -1,7 +1,7 @@
+ //! The `fetch_stage` batches input from a UDP socket and sends it to a channel.
+ 
+ use {
+-    crate::result::{Error, Result},
++    crate::{proxy::tpu_transaction_proxy::TpuTransactionProxy, result::{Error, Result}},
+     crossbeam_channel::{RecvTimeoutError, TrySendError, unbounded},
+     solana_clock::{DEFAULT_TICKS_PER_SLOT, HOLD_TRANSACTIONS_SLOT_OFFSET},
+     solana_metrics::{inc_new_counter_debug, inc_new_counter_info},
+@@ -48,6 +48,7 @@ impl FetchStage {
+                 forward_receiver,
+                 poh_recorder,
+                 coalesce,
++                None,
+             ),
+             receiver,
+             vote_receiver,
+@@ -62,6 +63,7 @@ impl FetchStage {
+         forward_receiver: PacketBatchReceiver,
+         poh_recorder: &Arc<RwLock<PohRecorder>>,
+         coalesce: Option<Duration>,
++        tpu_fwd_proxy: Option<TpuTransactionProxy>,
+     ) -> Self {
+         let tpu_vote_sockets = tpu_vote_sockets.into_iter().map(Arc::new).collect();
+         Self::new_multi_socket(
+@@ -72,6 +74,7 @@ impl FetchStage {
+             forward_receiver,
+             poh_recorder,
+             coalesce,
++            tpu_fwd_proxy,
+         )
+     }
+ 
+@@ -79,6 +82,7 @@ impl FetchStage {
+         recvr: &PacketBatchReceiver,
+         sendr: &PacketBatchSender,
+         poh_recorder: &Arc<RwLock<PohRecorder>>,
++        tpu_proxy: &Option<TpuTransactionProxy>,
+     ) -> Result<()> {
+         let mark_forwarded = |mut packet: PacketRefMut| {
+             packet.meta_mut().flags |= PacketFlags::FORWARDED;
+@@ -98,6 +102,12 @@ impl FetchStage {
+             }
+         }
+ 
++        if let Some(proxy) = tpu_proxy {
++            for batch in &packet_batches {
++                proxy.proxy_packet_batch(batch);
++            }
++        }
++
+         if poh_recorder
+             .read()
+             .unwrap()
+@@ -136,6 +146,7 @@ impl FetchStage {
+         forward_receiver: PacketBatchReceiver,
+         poh_recorder: &Arc<RwLock<PohRecorder>>,
+         coalesce: Option<Duration>,
++        tpu_fwd_proxy: Option<TpuTransactionProxy>,
+     ) -> Self {
+         let recycler: PacketBatchRecycler = Recycler::warmed(1000, 1024);
+ 
+@@ -166,7 +177,7 @@ impl FetchStage {
+             .spawn(move || {
+                 loop {
+                     if let Err(e) =
+-                        Self::handle_forwarded_packets(&forward_receiver, &sender, &poh_recorder)
++                        Self::handle_forwarded_packets(&forward_receiver, &sender, &poh_recorder, &tpu_fwd_proxy)
+                     {
+                         match e {
+                             Error::RecvTimeout(RecvTimeoutError::Disconnected) => break,
+diff --git a/core/src/proxy/fetch_stage_manager.rs b/core/src/proxy/fetch_stage_manager.rs
+index df34dd2828..fdd30056a8 100644
+--- a/core/src/proxy/fetch_stage_manager.rs
++++ b/core/src/proxy/fetch_stage_manager.rs
+@@ -1,7 +1,7 @@
+ use {
+     crate::{
+         bam_dependencies::BamConnectionState,
+-        proxy::{HeartbeatEvent, ProxyError},
++        proxy::{HeartbeatEvent, ProxyError, tpu_transaction_proxy::TpuTransactionProxy},
+     },
+     arc_swap::ArcSwap,
+     crossbeam_channel::{Receiver, RecvError, Sender, select, tick},
+@@ -53,6 +53,7 @@ impl FetchStageManager {
+         bam_enabled: Arc<AtomicU8>,
+         my_fallback_contact_info: contact_info::ContactInfo,
+         bam_tpu_info: Arc<ArcSwap<Option<(SocketAddr, SocketAddr)>>>,
++        tpu_proxy: TpuTransactionProxy,
+     ) -> Self {
+         let t_hdl = Self::start(
+             cluster_info,
+@@ -63,6 +64,7 @@ impl FetchStageManager {
+             bam_enabled,
+             my_fallback_contact_info,
+             bam_tpu_info,
++            tpu_proxy,
+         );
+ 
+         Self { t_hdl }
+@@ -77,6 +79,7 @@ impl FetchStageManager {
+         bam_enabled: Arc<AtomicU8>,
+         my_fallback_contact_info: contact_info::ContactInfo,
+         bam_tpu_info: Arc<ArcSwap<Option<(SocketAddr, SocketAddr)>>>,
++        tpu_proxy: TpuTransactionProxy,
+     ) -> JoinHandle<()> {
+         Builder::new()
+             .name("fetch-stage-manager".into())
+@@ -110,7 +113,12 @@ impl FetchStageManager {
+                 // Run the semi-eternal loop
+                 while !exit.load(Ordering::Relaxed) {
+                     let all_good = select! {
+-                        recv(packet_intercept_rx) -> pkt => tpu_state_machine.handle_packet_batch(pkt),
++                        recv(packet_intercept_rx) -> pkt => {
++                            if let Ok(ref pkt) = pkt {
++                                tpu_proxy.proxy_packet_batch(pkt);
++                            }
++                            tpu_state_machine.handle_packet_batch(pkt)
++                        },
+                         recv(state_machine_tick) -> _ => {
+                             tpu_state_machine.state_machine_tick();
+                             true
+diff --git a/core/src/proxy/mod.rs b/core/src/proxy/mod.rs
+index 442a409ac8..3bc9f4f7cf 100644
+--- a/core/src/proxy/mod.rs
++++ b/core/src/proxy/mod.rs
+@@ -14,6 +14,7 @@ mod auth;
+ pub mod block_engine_stage;
+ pub mod fetch_stage_manager;
+ pub mod relayer_stage;
++pub mod tpu_transaction_proxy;
+ 
+ use {
+     std::{
+diff --git a/core/src/proxy/tpu_transaction_proxy.rs b/core/src/proxy/tpu_transaction_proxy.rs
+new file mode 100644
+index 0000000000..be2a8acb87
+--- /dev/null
++++ b/core/src/proxy/tpu_transaction_proxy.rs
+@@ -0,0 +1,69 @@
++use {
++    arc_swap::ArcSwap,
++    solana_gossip::cluster_info::ClusterInfo,
++    solana_perf::packet::PacketBatch,
++    std::{
++        net::{SocketAddr, UdpSocket},
++        sync::Arc,
++    },
++};
++
++/// Max serialized transaction (1232) + 32-byte validator identity.
++const MAX_PROXY_DATAGRAM: usize = 1264;
++
++/// Smallest valid Solana transaction: 1 (num_sigs) + 64 (sig) + 3 (header)
++/// + 1 (num_accounts) + 32 (account) + 32 (blockhash) + 1 (num_instructions).
++const MIN_TRANSACTION_SIZE: usize = 134;
++
++/// Fire-and-forget UDP proxy for incoming TPU transactions.
++/// Appends the validator's 32-byte identity pubkey to each datagram
++/// so the receiving side can identify the source validator.
++/// Identity is read from ClusterInfo on every batch to reflect runtime changes.
++pub struct TpuTransactionProxy {
++    socket: UdpSocket,
++    targets: Arc<ArcSwap<Vec<SocketAddr>>>,
++    cluster_info: Arc<ClusterInfo>,
++}
++
++impl TpuTransactionProxy {
++    pub fn new(targets: Arc<ArcSwap<Vec<SocketAddr>>>, cluster_info: Arc<ClusterInfo>) -> Self {
++        let socket = UdpSocket::bind("0.0.0.0:0").expect("bind proxy UDP socket");
++        socket
++            .set_nonblocking(true)
++            .expect("set proxy UDP socket non-blocking");
++        Self {
++            socket,
++            targets,
++            cluster_info,
++        }
++    }
++
++    /// Proxy every packet in the batch to all configured targets.
++    /// Each datagram = raw transaction bytes ++ 32-byte validator identity.
++    /// Silently drops on send errors (non-blocking).
++    pub fn proxy_packet_batch(&self, pkt: &PacketBatch) {
++        let targets = self.targets.load();
++        if targets.is_empty() {
++            return;
++        }
++        let identity = self.cluster_info.id().to_bytes();
++        let mut buf = [0u8; MAX_PROXY_DATAGRAM];
++        for packet in pkt.iter() {
++            if packet.meta().discard() {
++                continue;
++            }
++            let size = packet.meta().size;
++            if size < MIN_TRANSACTION_SIZE || size + 32 > MAX_PROXY_DATAGRAM {
++                continue;
++            }
++            if let Some(data) = packet.data(..size) {
++                let total = size + 32;
++                buf[..size].copy_from_slice(data);
++                buf[size..total].copy_from_slice(&identity);
++                for target in targets.iter() {
++                    let _ = self.socket.send_to(&buf[..total], target);
++                }
++            }
++        }
++    }
++}
+diff --git a/core/src/tpu.rs b/core/src/tpu.rs
+index 4b95c35ce7..30196351da 100644
+--- a/core/src/tpu.rs
++++ b/core/src/tpu.rs
+@@ -181,6 +181,7 @@ impl Tpu {
+         bam_shred_receiver_addresses: Arc<ArcSwap<ShredReceiverAddresses>>,
+         multicast_receiver_address: Arc<ArcSwap<Option<SocketAddr>>>,
+         bam_url: Arc<ArcSwap<Option<String>>>,
++        tpu_proxy_addresses: Arc<ArcSwap<Vec<SocketAddr>>>,
+     ) -> Self {
+         let TpuSockets {
+             vote: tpu_vote_sockets,
+@@ -216,6 +217,10 @@ impl Tpu {
+             forwarded_packet_receiver,
+             poh_recorder,
+             None, // coalesce
++            Some(crate::proxy::tpu_transaction_proxy::TpuTransactionProxy::new(
++                tpu_proxy_addresses.clone(),
++                cluster_info.clone(),
++            )),
+         );
+ 
+         let staked_nodes_updater_service = StakedNodesUpdaterService::new(
+@@ -355,6 +360,10 @@ impl Tpu {
+         );
+ 
+         let bam_tpu_info = Arc::new(ArcSwap::new(Arc::new(None)));
++        let tpu_proxy = crate::proxy::tpu_transaction_proxy::TpuTransactionProxy::new(
++            tpu_proxy_addresses,
++            cluster_info.clone(),
++        );
+         let (heartbeat_tx, heartbeat_rx) = bounded(TPU_CHANNEL_SIZE);
+         let fetch_stage_manager = FetchStageManager::new(
+             cluster_info.clone(),
+@@ -365,6 +374,7 @@ impl Tpu {
+             bam_enabled.clone(),
+             cluster_info.my_contact_info().clone(),
+             bam_tpu_info.clone(),
++            tpu_proxy,
+         );
+ 
+         let relayer_stage = RelayerStage::new(
+diff --git a/core/src/validator.rs b/core/src/validator.rs
+index 65dfd8960c..b0cac1031a 100644
+--- a/core/src/validator.rs
++++ b/core/src/validator.rs
+@@ -421,6 +421,7 @@ pub struct ValidatorConfig {
+     pub multicast_receiver_address: Arc<ArcSwap<Option<SocketAddr>>>,
+     pub tip_manager_config: TipManagerConfig,
+     pub bam_url: Arc<ArcSwap<Option<String>>>,
++    pub tpu_proxy_addresses: Arc<ArcSwap<Vec<SocketAddr>>>,
+     /// Skips automatic multicast route detection and multicast receiver updates.
+     pub disable_multicast_shred_check: bool,
+ }
+@@ -514,6 +515,7 @@ impl ValidatorConfig {
+             multicast_receiver_address: Arc::new(ArcSwap::from_pointee(None)),
+             tip_manager_config: TipManagerConfig::default(),
+             bam_url: Arc::new(ArcSwap::from_pointee(None)),
++            tpu_proxy_addresses: Arc::new(ArcSwap::from_pointee(Vec::new())),
+             disable_multicast_shred_check: false,
+         }
+     }
+@@ -1810,6 +1812,7 @@ impl Validator {
+             bam_shred_receiver_addresses,
+             config.multicast_receiver_address.clone(),
+             config.bam_url.clone(),
++            config.tpu_proxy_addresses.clone(),
+         );
+ 
+         datapoint_info!(
+@@ -1847,6 +1850,7 @@ impl Validator {
+             relayer_config: config.relayer_config.clone(),
+             shred_receiver_addresses: config.shred_receiver_addresses.clone(),
+             shred_retransmit_receiver_addresses: config.shred_retransmit_receiver_addresses.clone(),
++            tpu_proxy_addresses: config.tpu_proxy_addresses.clone(),
+         });
+ 
+         let multicast_shred_check_service = (!config.disable_multicast_shred_check
+diff --git a/validator/src/admin_rpc_service.rs b/validator/src/admin_rpc_service.rs
+index 6790cb8b6a..f04d97335c 100644
+--- a/validator/src/admin_rpc_service.rs
++++ b/validator/src/admin_rpc_service.rs
+@@ -338,6 +338,13 @@ pub trait AdminRpc {
+         meta: Self::Metadata,
+         addr: String,
+     ) -> Result<()>;
++
++    #[rpc(meta, name = "setTpuProxyAddresses")]
++    fn set_tpu_proxy_addresses(
++        &self,
++        meta: Self::Metadata,
++        addrs: String,
++    ) -> Result<()>;
+ }
+ 
+ pub struct AdminRpcImpl;
+@@ -757,6 +764,44 @@ impl AdminRpc for AdminRpcImpl {
+         })
+     }
+ 
++    fn set_tpu_proxy_addresses(
++        &self,
++        meta: Self::Metadata,
++        addrs: String,
++    ) -> Result<()> {
++        use std::net::ToSocketAddrs;
++        let addrs = addrs.trim();
++        let parsed: Vec<SocketAddr> = if addrs.is_empty() {
++            Vec::new()
++        } else {
++            addrs
++                .split(',')
++                .map(|s| {
++                    let s = s.trim();
++                    s.to_socket_addrs()
++                        .map_err(|e| {
++                            jsonrpc_core::error::Error::invalid_params(format!(
++                                "invalid tpu proxy address '{s}': {e}"
++                            ))
++                        })?
++                        .next()
++                        .ok_or_else(|| {
++                            jsonrpc_core::error::Error::invalid_params(format!(
++                                "tpu proxy address '{s}' did not resolve"
++                            ))
++                        })
++                })
++                .collect::<Result<Vec<_>>>()?
++        };
++        info!("Setting TPU proxy addresses: {:?}", parsed);
++        meta.with_post_init(|post_init| {
++            post_init
++                .tpu_proxy_addresses
++                .store(Arc::new(parsed));
++            Ok(())
++        })
++    }
++
+     fn set_staked_nodes_overrides(&self, meta: Self::Metadata, path: String) -> Result<()> {
+         let loaded_config = load_staked_nodes_overrides(&path)
+             .map_err(|err| {
+diff --git a/validator/src/cli.rs b/validator/src/cli.rs
+index 580d654a62..9c459fa376 100644
+--- a/validator/src/cli.rs
++++ b/validator/src/cli.rs
+@@ -88,7 +88,8 @@ pub fn app<'a>(version: &'a str, default_args: &'a DefaultArgs) -> App<'a, 'a> {
+         .subcommand(commands::shred::shred_receiver_command(default_args))
+         .subcommand(commands::shred::shred_retransmit_receiver_command(
+             default_args,
+-        ));
++        ))
++        .subcommand(commands::tpu_proxy::command(default_args));
+ 
+     commands::run::add_args(app, default_args)
+         .args(&thread_args(&default_args.thread_args))
+diff --git a/validator/src/commands/mod.rs b/validator/src/commands/mod.rs
+index 53f57a215e..37bafa231e 100644
+--- a/validator/src/commands/mod.rs
++++ b/validator/src/commands/mod.rs
+@@ -16,6 +16,7 @@ pub mod set_log_filter;
+ pub mod set_public_address;
+ pub mod shred;
+ pub mod staked_nodes_overrides;
++pub mod tpu_proxy;
+ pub mod wait_for_restart_window;
+ 
+ use thiserror::Error;
+diff --git a/validator/src/commands/run/args.rs b/validator/src/commands/run/args.rs
+index 7af9d674ed..122eee1035 100644
+--- a/validator/src/commands/run/args.rs
++++ b/validator/src/commands/run/args.rs
+@@ -1338,6 +1338,19 @@ pub fn add_args<'a>(app: App<'a, 'a>, default_args: &'a DefaultArgs) -> App<'a,
+                  only value to disable.",
+             ),
+     )
++    .arg(
++        Arg::with_name("tpu_proxy_address")
++            .long("tpu-proxy-address")
++            .value_name("TPU_PROXY_ADDRESS")
++            .takes_value(true)
++            .multiple(true)
++            .help(
++                "Proxy all incoming non-vote TPU transactions to these addresses via UDP. \
++                 Each transaction is sent as a raw UDP datagram with 32-byte validator \
++                 identity appended. Pass this flag multiple times or use comma-separated \
++                 entries; each entry may be ip:port or host:port.",
++            ),
++    )
+     .arg(
+         Arg::with_name("disable_multicast_shred_check")
+             .long("disable-multicast-shred-check")
+diff --git a/validator/src/commands/run/execute.rs b/validator/src/commands/run/execute.rs
+index 2eab0541ed..de6a6981e5 100644
+--- a/validator/src/commands/run/execute.rs
++++ b/validator/src/commands/run/execute.rs
+@@ -857,6 +857,38 @@ pub fn execute(
+         })?,
+     ));
+ 
++    let tpu_proxy_addresses = Arc::new(ArcSwap::from_pointee({
++        use std::net::ToSocketAddrs;
++        let mut addrs = Vec::new();
++        if let Some(values) = matches.values_of("tpu_proxy_address") {
++            for value in values {
++                for part in value.split(',') {
++                    let part = part.trim();
++                    if part.is_empty() {
++                        continue;
++                    }
++                    let addr = part
++                        .to_socket_addrs()
++                        .map_err(|e| {
++                            io::Error::new(
++                                io::ErrorKind::InvalidInput,
++                                format!("invalid tpu proxy address '{part}': {e}"),
++                            )
++                        })?
++                        .next()
++                        .ok_or_else(|| {
++                            io::Error::new(
++                                io::ErrorKind::InvalidInput,
++                                format!("tpu proxy address '{part}' did not resolve"),
++                            )
++                        })?;
++                    addrs.push(addr);
++                }
++            }
++        }
++        addrs
++    }));
++
+     let mut validator_config = ValidatorConfig {
+         log_config,
+         require_tower: matches.is_present("require_tower"),
+@@ -984,6 +1016,7 @@ pub fn execute(
+         multicast_receiver_address: Arc::new(ArcSwap::from_pointee(None)),
+         tip_manager_config,
+         bam_url,
++        tpu_proxy_addresses,
+         disable_multicast_shred_check: matches.is_present("disable_multicast_shred_check"),
+     };
+     validator_config
+diff --git a/validator/src/commands/tpu_proxy/mod.rs b/validator/src/commands/tpu_proxy/mod.rs
+new file mode 100644
+index 0000000000..6906a70ca0
+--- /dev/null
++++ b/validator/src/commands/tpu_proxy/mod.rs
+@@ -0,0 +1,30 @@
++use {
++    crate::{admin_rpc_service, cli::DefaultArgs, commands::Result},
++    clap::{App, Arg, ArgMatches, SubCommand, value_t_or_exit},
++    std::path::Path,
++};
++
++pub fn command(_default_args: &DefaultArgs) -> App<'_, '_> {
++    SubCommand::with_name("set-tpu-proxy-addresses")
++        .about("Set TPU proxy addresses for forwarding incoming transactions via UDP")
++        .arg(
++            Arg::with_name("tpu_proxy_address")
++                .long("tpu-proxy-address")
++                .value_name("TPU_PROXY_ADDRESS")
++                .takes_value(true)
++                .help(
++                    "Comma-separated list of ip:port addresses to proxy TPU transactions to via \
++                     UDP. Each incoming non-vote transaction will be sent as a raw UDP datagram to \
++                     all specified addresses. Set to empty string to disable proxying.",
++                )
++                .required(true),
++        )
++}
++
++pub fn execute(subcommand_matches: &ArgMatches, ledger_path: &Path) -> Result<()> {
++    let addrs = value_t_or_exit!(subcommand_matches, "tpu_proxy_address", String);
++    let admin_client = admin_rpc_service::connect(ledger_path);
++    admin_rpc_service::runtime()
++        .block_on(async move { admin_client.await?.set_tpu_proxy_addresses(addrs).await })?;
++    Ok(())
++}
+diff --git a/validator/src/main.rs b/validator/src/main.rs
+index 84cff83dc1..307815e613 100644
+--- a/validator/src/main.rs
++++ b/validator/src/main.rs
+@@ -144,6 +144,9 @@ pub fn main() {
+         ("set-shred-retransmit-receiver-address", Some(subcommand_matches)) => {
+             commands::shred::set_shred_retransmit_receiver_execute(subcommand_matches, &ledger_path)
+         }
++        ("set-tpu-proxy-addresses", Some(subcommand_matches)) => {
++            commands::tpu_proxy::execute(subcommand_matches, &ledger_path)
++        }
+         _ => unreachable!(),
+     }
+     .unwrap_or_else(|err| {
+-- 
+2.44.0
+
